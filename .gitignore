@@ -1,0 +1,11 @@
+# Local configuration containing subscription/node credentials
+sing-box-config.json
+sing-box-conversion-notes.md
+subscriptions.json
+.subscriptions.json
+.subscription-test/
+
+# Runtime artifacts
+*.log
+*.bak
+*.tmp

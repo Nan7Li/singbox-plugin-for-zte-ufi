@@ -1,0 +1,123 @@
+#!/system/bin/sh
+ROOT=/data/sing-box
+BIN=$ROOT/bin/sing-box
+CONFIG=$ROOT/config/config.json
+PIDFILE=$ROOT/run/sing-box.pid
+LOG='/sdcard/sing-box内核日志.txt'
+LAN_IF=br0
+TPROXY_PORT=7893
+DNS_PORT=1053
+DASHBOARD_PORT=9090
+MIXED_PORT=7890
+FWMARK=0x2023
+ROUTE_TABLE=2023
+
+find_pid() {
+  pgrep -f "$BIN run -c $CONFIG" 2>/dev/null | head -n 1
+}
+
+cleanup_tproxy() {
+  iptables -w 10 -t mangle -D PREROUTING -i "$LAN_IF" -j SINGBOX 2>/dev/null || true
+  iptables -w 10 -t mangle -F SINGBOX 2>/dev/null || true
+  iptables -w 10 -t mangle -X SINGBOX 2>/dev/null || true
+  iptables -w 10 -t nat -D PREROUTING -i "$LAN_IF" -j SINGBOX_DNS 2>/dev/null || true
+  iptables -w 10 -t nat -F SINGBOX_DNS 2>/dev/null || true
+  iptables -w 10 -t nat -X SINGBOX_DNS 2>/dev/null || true
+  iptables -w 10 -D INPUT -i "$LAN_IF" -p tcp --dport "$DASHBOARD_PORT" -j ACCEPT 2>/dev/null || true
+  iptables -w 10 -D INPUT -i "$LAN_IF" -p tcp --dport "$MIXED_PORT" -j ACCEPT 2>/dev/null || true
+  while ip rule del fwmark "$FWMARK" table "$ROUTE_TABLE" 2>/dev/null; do :; done
+  ip route flush table "$ROUTE_TABLE" 2>/dev/null || true
+}
+
+setup_tproxy() {
+  cleanup_tproxy
+  ip rule add fwmark "$FWMARK" table "$ROUTE_TABLE" || return 1
+  ip route add local 0.0.0.0/0 dev lo table "$ROUTE_TABLE" || return 1
+
+  iptables -w 10 -t mangle -N SINGBOX || return 1
+  iptables -w 10 -t mangle -A SINGBOX -p tcp --dport 53 -j RETURN || return 1
+  iptables -w 10 -t mangle -A SINGBOX -p udp --dport 53 -j RETURN || return 1
+  for subnet in \
+    0.0.0.0/8 10.0.0.0/8 100.64.0.0/10 127.0.0.0/8 \
+    169.254.0.0/16 172.16.0.0/12 192.0.0.0/24 192.0.2.0/24 \
+    192.88.99.0/24 192.168.0.0/16 198.51.100.0/24 203.0.113.0/24 \
+    224.0.0.0/4 240.0.0.0/4 255.255.255.255/32
+  do
+    iptables -w 10 -t mangle -A SINGBOX -d "$subnet" -j RETURN || return 1
+  done
+  iptables -w 10 -t mangle -A SINGBOX -p udp --dport 123 -j RETURN || return 1
+  iptables -w 10 -t mangle -A SINGBOX -p tcp -j TPROXY \
+    --on-ip 127.0.0.1 --on-port "$TPROXY_PORT" --tproxy-mark "$FWMARK" || return 1
+  iptables -w 10 -t mangle -A SINGBOX -p udp -j TPROXY \
+    --on-ip 127.0.0.1 --on-port "$TPROXY_PORT" --tproxy-mark "$FWMARK" || return 1
+  iptables -w 10 -t mangle -I PREROUTING 1 -i "$LAN_IF" -j SINGBOX || return 1
+
+  iptables -w 10 -t nat -N SINGBOX_DNS || return 1
+  iptables -w 10 -t nat -A SINGBOX_DNS -p tcp --dport 53 -j REDIRECT --to-ports "$DNS_PORT" || return 1
+  iptables -w 10 -t nat -A SINGBOX_DNS -p udp --dport 53 -j REDIRECT --to-ports "$DNS_PORT" || return 1
+  iptables -w 10 -t nat -I PREROUTING 1 -i "$LAN_IF" -j SINGBOX_DNS || return 1
+
+  iptables -w 10 -I INPUT 1 -i "$LAN_IF" -p tcp --dport "$DASHBOARD_PORT" -j ACCEPT || return 1
+  iptables -w 10 -I INPUT 1 -i "$LAN_IF" -p tcp --dport "$MIXED_PORT" -j ACCEPT || return 1
+}
+
+start_service() {
+  mkdir -p "$ROOT/run"
+  PID=$(find_pid)
+  if test -n "$PID" && kill -0 "$PID" 2>/dev/null; then
+    echo "$PID" > "$PIDFILE"
+    setup_tproxy || { echo 'TProxy 规则安装失败'; return 1; }
+    echo 'sing-box 已在运行，TProxy 规则已刷新'
+    return 0
+  fi
+  "$BIN" check -c "$CONFIG" || return 1
+  nohup "$BIN" run -c "$CONFIG" >> "$LOG" 2>&1 &
+  PID=$!
+  echo "$PID" > "$PIDFILE"
+  sleep 2
+  if ! kill -0 "$PID" 2>/dev/null; then
+    echo '启动失败，请查看日志'
+    rm -f "$PIDFILE"
+    return 1
+  fi
+  if ! setup_tproxy; then
+    echo 'TProxy 规则安装失败，已回滚'
+    cleanup_tproxy
+    kill "$PID" 2>/dev/null || true
+    rm -f "$PIDFILE"
+    return 1
+  fi
+  echo 'sing-box TProxy 启动成功'
+}
+
+stop_service() {
+  cleanup_tproxy
+  PID=$(cat "$PIDFILE" 2>/dev/null)
+  if test -z "$PID"; then PID=$(find_pid); fi
+  if test -z "$PID"; then
+    echo 'sing-box 未运行，TProxy 规则已清理'
+    rm -f "$PIDFILE"
+    return 0
+  fi
+  kill "$PID" 2>/dev/null || true
+  COUNT=0
+  while kill -0 "$PID" 2>/dev/null && test "$COUNT" -lt 10; do
+    sleep 1
+    COUNT=$((COUNT + 1))
+  done
+  kill -9 "$PID" 2>/dev/null || true
+  rm -f "$PIDFILE"
+  echo 'sing-box 已停止，TProxy 规则已清理'
+}
+
+case "$1" in
+  start) start_service ;;
+  stop) stop_service ;;
+  restart) stop_service; start_service ;;
+  status)
+    PID=$(cat "$PIDFILE" 2>/dev/null)
+    if test -z "$PID"; then PID=$(find_pid); fi
+    test -n "$PID" && kill -0 "$PID" 2>/dev/null
+    ;;
+  *) echo '用法: sing-box.service {start|stop|restart|status}'; exit 1 ;;
+esac
