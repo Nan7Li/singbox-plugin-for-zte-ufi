@@ -1,4 +1,6 @@
 #!/system/bin/sh
+# Unofficial service helper for compatible ZTE UFI Tools environments.
+# Review interface names and firewall rules before use.
 ROOT=/data/sing-box
 BIN=$ROOT/bin/sing-box
 CONFIG=$ROOT/config/config.json

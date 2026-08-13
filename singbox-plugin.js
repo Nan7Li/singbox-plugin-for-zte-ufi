@@ -1,3 +1,5 @@
+// Unofficial sing-box plugin for compatible ZTE UFI Tools environments.
+// Attribution, licensing, and safety notes: README.md and THIRD_PARTY_NOTICES.md.
 //<script>
 (() => {
   'use strict';
