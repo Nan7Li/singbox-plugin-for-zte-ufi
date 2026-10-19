@@ -1,12 +1,16 @@
 #!/system/bin/sh
 # Unofficial service helper for compatible ZTE UFI Tools environments.
 # Review interface names and firewall rules before use.
+# 本文件会被 singbox-plugin.js 原样内嵌写入设备；修改时两边需保持一致，
+# 且不要使用反引号、反斜杠或美元符加左花括号（会破坏 JS 模板字符串）。
 ROOT=/data/sing-box
 BIN=$ROOT/bin/sing-box
 CONFIG=$ROOT/config/config.json
 PIDFILE=$ROOT/run/sing-box.pid
 LOG='/sdcard/sing-box内核日志.txt'
+LOG_MAX_BYTES=5242880
 LAN_IF=br0
+LAN_WAIT_SECONDS=30
 TPROXY_PORT=7893
 DNS_PORT=1053
 DASHBOARD_PORT=9090
@@ -14,8 +18,64 @@ MIXED_PORT=7890
 FWMARK=0x2023
 ROUTE_TABLE=2023
 
+# 只认可执行文件确实是 $BIN 的进程，避免 PID 被系统复用后误杀其他进程。
+is_singbox_pid() {
+  test -n "$1" && kill -0 "$1" 2>/dev/null || return 1
+  case "$(readlink "/proc/$1/exe" 2>/dev/null)" in
+    "$BIN"|"$BIN "*) return 0 ;;
+  esac
+  return 1
+}
+
 find_pid() {
-  pgrep -f "$BIN run -c $CONFIG" 2>/dev/null | head -n 1
+  for P in $(pgrep -f "$BIN run" 2>/dev/null); do
+    if is_singbox_pid "$P"; then echo "$P"; return 0; fi
+  done
+  return 1
+}
+
+current_pid() {
+  P=$(cat "$PIDFILE" 2>/dev/null)
+  if is_singbox_pid "$P"; then echo "$P"; return 0; fi
+  find_pid
+}
+
+rotate_log() {
+  SIZE=$(wc -c < "$LOG" 2>/dev/null)
+  SIZE=$((SIZE + 0))
+  if test "$SIZE" -gt "$LOG_MAX_BYTES"; then
+    tail -n 2000 "$LOG" > "$LOG.tmp" 2>/dev/null && cat "$LOG.tmp" > "$LOG"
+    rm -f "$LOG.tmp"
+  fi
+}
+
+# 开机自启时 br0 可能还没创建，等待一段时间再装规则。
+wait_lan() {
+  N=0
+  while ! ip link show "$LAN_IF" >/dev/null 2>&1; do
+    N=$((N + 1))
+    if test "$N" -ge "$LAN_WAIT_SECONDS"; then echo "未找到 LAN 接口 $LAN_IF"; return 1; fi
+    sleep 1
+  done
+}
+
+# $1 为 -I（添加）或 -D（删除）。放行面板、Mixed、DNS 重定向端口和 TProxy 标记流量，
+# 否则 INPUT 链默认拒绝时局域网 DNS 和透明代理会失效。
+input_rules() {
+  ACT=$1
+  for RULE in "tcp $DASHBOARD_PORT" "tcp $MIXED_PORT" "tcp $DNS_PORT" "udp $DNS_PORT"; do
+    set -- $RULE
+    if test "$ACT" = -D; then
+      iptables -w 10 -D INPUT -i "$LAN_IF" -p "$1" --dport "$2" -j ACCEPT 2>/dev/null || true
+    else
+      iptables -w 10 -I INPUT 1 -i "$LAN_IF" -p "$1" --dport "$2" -j ACCEPT || return 1
+    fi
+  done
+  if test "$ACT" = -D; then
+    iptables -w 10 -D INPUT -i "$LAN_IF" -m mark --mark "$FWMARK" -j ACCEPT 2>/dev/null || true
+  else
+    iptables -w 10 -I INPUT 1 -i "$LAN_IF" -m mark --mark "$FWMARK" -j ACCEPT || return 1
+  fi
 }
 
 cleanup_tproxy() {
@@ -25,33 +85,27 @@ cleanup_tproxy() {
   iptables -w 10 -t nat -D PREROUTING -i "$LAN_IF" -j SINGBOX_DNS 2>/dev/null || true
   iptables -w 10 -t nat -F SINGBOX_DNS 2>/dev/null || true
   iptables -w 10 -t nat -X SINGBOX_DNS 2>/dev/null || true
-  iptables -w 10 -D INPUT -i "$LAN_IF" -p tcp --dport "$DASHBOARD_PORT" -j ACCEPT 2>/dev/null || true
-  iptables -w 10 -D INPUT -i "$LAN_IF" -p tcp --dport "$MIXED_PORT" -j ACCEPT 2>/dev/null || true
+  # 重复删除，兼容旧版本或多次启动遗留的重复规则。
+  for I in 1 2 3; do input_rules -D; done
   while ip rule del fwmark "$FWMARK" table "$ROUTE_TABLE" 2>/dev/null; do :; done
   ip route flush table "$ROUTE_TABLE" 2>/dev/null || true
 }
 
 setup_tproxy() {
   cleanup_tproxy
+  wait_lan || return 1
   ip rule add fwmark "$FWMARK" table "$ROUTE_TABLE" || return 1
   ip route add local 0.0.0.0/0 dev lo table "$ROUTE_TABLE" || return 1
 
   iptables -w 10 -t mangle -N SINGBOX || return 1
   iptables -w 10 -t mangle -A SINGBOX -p tcp --dport 53 -j RETURN || return 1
   iptables -w 10 -t mangle -A SINGBOX -p udp --dport 53 -j RETURN || return 1
-  for subnet in \
-    0.0.0.0/8 10.0.0.0/8 100.64.0.0/10 127.0.0.0/8 \
-    169.254.0.0/16 172.16.0.0/12 192.0.0.0/24 192.0.2.0/24 \
-    192.88.99.0/24 192.168.0.0/16 198.51.100.0/24 203.0.113.0/24 \
-    224.0.0.0/4 240.0.0.0/4 255.255.255.255/32
-  do
+  for subnet in 0.0.0.0/8 10.0.0.0/8 100.64.0.0/10 127.0.0.0/8 169.254.0.0/16 172.16.0.0/12 192.0.0.0/24 192.0.2.0/24 192.88.99.0/24 192.168.0.0/16 198.51.100.0/24 203.0.113.0/24 224.0.0.0/4 240.0.0.0/4 255.255.255.255/32; do
     iptables -w 10 -t mangle -A SINGBOX -d "$subnet" -j RETURN || return 1
   done
   iptables -w 10 -t mangle -A SINGBOX -p udp --dport 123 -j RETURN || return 1
-  iptables -w 10 -t mangle -A SINGBOX -p tcp -j TPROXY \
-    --on-ip 127.0.0.1 --on-port "$TPROXY_PORT" --tproxy-mark "$FWMARK" || return 1
-  iptables -w 10 -t mangle -A SINGBOX -p udp -j TPROXY \
-    --on-ip 127.0.0.1 --on-port "$TPROXY_PORT" --tproxy-mark "$FWMARK" || return 1
+  iptables -w 10 -t mangle -A SINGBOX -p tcp -j TPROXY --on-ip 127.0.0.1 --on-port "$TPROXY_PORT" --tproxy-mark "$FWMARK" || return 1
+  iptables -w 10 -t mangle -A SINGBOX -p udp -j TPROXY --on-ip 127.0.0.1 --on-port "$TPROXY_PORT" --tproxy-mark "$FWMARK" || return 1
   iptables -w 10 -t mangle -I PREROUTING 1 -i "$LAN_IF" -j SINGBOX || return 1
 
   iptables -w 10 -t nat -N SINGBOX_DNS || return 1
@@ -59,26 +113,27 @@ setup_tproxy() {
   iptables -w 10 -t nat -A SINGBOX_DNS -p udp --dport 53 -j REDIRECT --to-ports "$DNS_PORT" || return 1
   iptables -w 10 -t nat -I PREROUTING 1 -i "$LAN_IF" -j SINGBOX_DNS || return 1
 
-  iptables -w 10 -I INPUT 1 -i "$LAN_IF" -p tcp --dport "$DASHBOARD_PORT" -j ACCEPT || return 1
-  iptables -w 10 -I INPUT 1 -i "$LAN_IF" -p tcp --dport "$MIXED_PORT" -j ACCEPT || return 1
+  input_rules -I || return 1
 }
 
 start_service() {
   mkdir -p "$ROOT/run"
-  PID=$(find_pid)
-  if test -n "$PID" && kill -0 "$PID" 2>/dev/null; then
+  PID=$(current_pid)
+  if test -n "$PID"; then
     echo "$PID" > "$PIDFILE"
     setup_tproxy || { echo 'TProxy 规则安装失败'; return 1; }
     echo 'sing-box 已在运行，TProxy 规则已刷新'
     return 0
   fi
-  "$BIN" check -c "$CONFIG" || return 1
+  "$BIN" check -c "$CONFIG" || { echo '配置校验失败'; return 1; }
+  rotate_log
   nohup "$BIN" run -c "$CONFIG" >> "$LOG" 2>&1 &
   PID=$!
   echo "$PID" > "$PIDFILE"
   sleep 2
   if ! kill -0 "$PID" 2>/dev/null; then
-    echo '启动失败，请查看日志'
+    echo '启动失败，最近日志：'
+    tail -n 15 "$LOG" 2>/dev/null
     rm -f "$PIDFILE"
     return 1
   fi
@@ -94,8 +149,7 @@ start_service() {
 
 stop_service() {
   cleanup_tproxy
-  PID=$(cat "$PIDFILE" 2>/dev/null)
-  if test -z "$PID"; then PID=$(find_pid); fi
+  PID=$(current_pid)
   if test -z "$PID"; then
     echo 'sing-box 未运行，TProxy 规则已清理'
     rm -f "$PIDFILE"
@@ -107,7 +161,7 @@ stop_service() {
     sleep 1
     COUNT=$((COUNT + 1))
   done
-  kill -9 "$PID" 2>/dev/null || true
+  if kill -0 "$PID" 2>/dev/null; then kill -9 "$PID" 2>/dev/null || true; fi
   rm -f "$PIDFILE"
   echo 'sing-box 已停止，TProxy 规则已清理'
 }
@@ -116,10 +170,6 @@ case "$1" in
   start) start_service ;;
   stop) stop_service ;;
   restart) stop_service; start_service ;;
-  status)
-    PID=$(cat "$PIDFILE" 2>/dev/null)
-    if test -z "$PID"; then PID=$(find_pid); fi
-    test -n "$PID" && kill -0 "$PID" 2>/dev/null
-    ;;
+  status) current_pid >/dev/null ;;
   *) echo '用法: sing-box.service {start|stop|restart|status}'; exit 1 ;;
 esac

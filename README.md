@@ -12,8 +12,10 @@
 - 查看、刷新、清空和下载运行日志。
 - 上传自定义 sing-box 可执行文件，并在替换前执行版本检查。
 - 支持 Android 路由设备上的 TProxy 透明代理和 DNS 劫持规则。
-- 保存两个 sing-box/通用订阅地址，合并节点与选择器，并在更新失败时回滚。
-- 可生成 Mixed 入站和 Clash API 配置。
+- 保存两个订阅地址（可只填一个），支持 sing-box JSON 订阅和通用 Base64 分享链接订阅，合并节点与选择器，并在更新失败时回滚。
+  - 分享链接支持 VLESS（含 Reality、WS/gRPC/HTTPUpgrade/H2 传输）、VMess、Trojan、Shadowsocks（含 SIP002 / 2022）、Hysteria2（含端口跳跃、salamander 混淆）、TUIC 和 AnyTLS；不支持的节点会被跳过并提示数量。
+  - 每次更新会重建 `订阅/总选择` 选择器；若当前默认出站为直连且没有任何分流规则，会自动把 `route.final` 指向它。用户自建分组中指向已下线节点的引用会被自动清理。
+- 可生成 Mixed 入站和 Clash API 配置，“面板信息”按钮可查看面板地址和 API 密钥。
 
 ## 兼容性与前提
 
